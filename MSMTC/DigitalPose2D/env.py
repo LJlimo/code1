@@ -6,7 +6,7 @@ from gym import spaces
 import numpy as np
 from .potential_field import calculate_attract_potential, calculate_repel_potential
 from .reward_fuctions import RewardFunction, Reward_Cover_Only
-from .render1 import render
+from .render import render
 
 class Pose_Env_Base(gym.Env):
     def __init__(self, args, config_name='env.json', setting_path=None):
