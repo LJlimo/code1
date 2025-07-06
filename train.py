@@ -5,11 +5,11 @@ import torch
 import numpy as np
 from tqdm import trange
 from MSMTC.DigitalPose2D.env import Pose_Env_Base
-from agentnew import MAPPOAgent
+from agent import MAPPOAgent
 from model import ActorEncoder, PolicyNet, CriticEncoder, ValueNet, ActorNet, CriticNet
 from buffer import RolloutBuffer
 from torch.utils.tensorboard import SummaryWriter
-from utils import process_obs_list
+from utils import process_obs_list, process_obs
 import argparse
 
 
@@ -22,16 +22,18 @@ def train(env, agent, buffer, num_episodes, max_rollout_steps, device, args):
     current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join('logs', f'coverage_logs_{current_time}')
     writer = SummaryWriter(log_dir)
-
+    
     # ----一个episode代表一次完整的训练过程：采样+PPO更新----
     for episode_i in pbar: 
         
+        episode_return = 0 # 每个episode的总奖励
+
         generate_gif_every = 100  # 每100个episode生成一次gif
         generate_gif = (episode_i % generate_gif_every == 0) # 是否生成gif图像
 
         obs_dict = env.reset()
-        obs_list = obs_dict['obs']
-        global_state = obs_dict['global']  # 获取全局状态
+        local_obs = obs_dict['obs']
+        global_obs = obs_dict['global']  # 获取全局状态
 
         agent.eval() # 切换到eval, 采样阶段使用稳定的策略
         
@@ -41,17 +43,28 @@ def train(env, agent, buffer, num_episodes, max_rollout_steps, device, args):
 
         # ----rollout采样：采样rollout_steps步----
         for step_i in range(max_rollout_steps):
-            # ----将观测处理为定长（max_visual_num）转换为张量----
-            obs_tensor, obs_mask = process_obs_list(obs_list, args.max_visual_num, obs_dim=env.state_dim, device=device, strategy='nearest')
+            # # ----将观测处理为定长（max_visual_num）转换为张量----
+            # obs_tensor, obs_mask = process_obs_list(local_obs, args.max_visual_num, obs_dim=env.state_dim, device=device, strategy='nearest')
+
+            # 先不采用匿名环境
+            obs_tensor, obs_mask, self_info = process_obs(local_obs, env.num_targets, device=device)
 
             # ----与环境交互、采样动作、得到log_probs、values----
             with torch.no_grad():
-                actions, log_probs = agent.select_action(obs_tensor, obs_mask, None)
+                current_value = agent.critic_net(torch.tensor(global_obs, dtype=torch.float32, device=device)).squeeze(-1) # 计算当前状态的value
+                actions, log_probs = agent.select_action(obs_tensor, obs_mask, self_info, None)
 
             # ----与环境交互----
             next_obs_dict, rewards, dones, info = env.step(actions.tolist())
+            episode_return += np.mean(rewards)  # 累计奖励
             next_obs_list = next_obs_dict['obs']
             next_global_state = next_obs_dict['global']
+
+            if isinstance(dones, bool):
+                dones_vector = [dones] * env.num_cameras  # 扩展为6个相机
+            else:
+                dones_vector = dones
+
             if generate_gif:  # 每100个episode收集一次帧
                 frame = env.render(return_rgb_array=True)  # 获取当前帧图像
                 frames.append(frame)  # 存储帧图像
@@ -60,17 +73,18 @@ def train(env, agent, buffer, num_episodes, max_rollout_steps, device, args):
             buffer.insert(
                 obs_tensor=obs_tensor,
                 obs_mask=obs_mask,
-                global_state=torch.tensor(global_state, dtype=torch.float32, device=device),
+                self_info=self_info,
+                global_state=torch.tensor(global_obs, dtype=torch.float32, device=device),
                 actions=actions,
                 log_probs=log_probs.detach().to(device),
                 rewards=torch.tensor(rewards, dtype=torch.float32, device=device),
-                values=torch.zeros(env.num_cameras, device=device),  # 这里先填0，后面再计算
-                dones=torch.tensor(dones, device=device)
+                values=current_value,  # 当前状态的value
+                dones=torch.tensor(dones_vector, dtype=torch.bool, device=device)
             )
 
             # ----更新观测, 继续下一步----
-            obs_list = next_obs_list
-            global_state = next_global_state
+            local_obs = next_obs_list
+            global_obs = next_global_state
 
             # ----记录覆盖率，这里记录的是采样阶段的覆盖率，未经下一次PPO训练更新参数----
             coverage = info.get('coverage_rate', None)
@@ -84,29 +98,38 @@ def train(env, agent, buffer, num_episodes, max_rollout_steps, device, args):
 
         # ----计算Advantage（GAE）和Return----
         with torch.no_grad():
-            last_values = agent.critic_net(torch.tensor(global_state, dtype=torch.float32, device=device)).squeeze(-1) #最后一步的状态值，使用Critic计算
+            last_values = agent.critic_net(torch.tensor(global_obs, dtype=torch.float32, device=device)).squeeze(-1) #最后一步的状态值，使用Critic计算
         buffer.compute_returns_and_advantages(last_values)
 
         # ----切换到train模式，PPO更新----
         agent.train()
 
         # ----更新PPO----
-        total_actor_loss, total_critic_loss, total_entropy, total_total_loss = 0, 0, 0, 0
+        total_actor_loss, total_critic_loss, total_entropy_loss, total_total_loss = 0, 0, 0, 0
         count = 0
         for batch in buffer.get_batches(args.batch_size, args.ppo_epochs):
             loss_dict = agent.update(batch)
             total_actor_loss += loss_dict['actor_loss']
             total_critic_loss += loss_dict['critic_loss']
-            total_entropy += loss_dict['entropy']
+            total_entropy_loss += loss_dict['entropy_loss']
             total_total_loss += loss_dict['total_loss']
             count += 1
 
-        # 平均
+        # 平均loss
         writer.add_scalar('Loss/Total', total_total_loss / count, global_step=episode_i)
         writer.add_scalar('Loss/Actor', total_actor_loss / count, global_step=episode_i)
         writer.add_scalar('Loss/Critic', total_critic_loss / count, global_step=episode_i)
-        writer.add_scalar('Loss/Entropy', total_entropy / count, global_step=episode_i)
+        writer.add_scalar('Loss/Entropy', total_entropy_loss / count, global_step=episode_i)
+        writer.add_scalar('Return/Episode', episode_return, global_step=episode_i)
 
+
+        # 在PPO更新后添加--测试
+        writer.add_scalar('Gradients/Actor_Norm', loss_dict.get('actor_grad_norm', 0), global_step=episode_i)
+        writer.add_scalar('Gradients/Critic_Norm', loss_dict.get('critic_grad_norm', 0), global_step=episode_i)
+        writer.add_scalar('Gradients/Actor_Max', loss_dict.get('actor_max_grad', 0), global_step=episode_i)
+        writer.add_scalar('Gradients/Critic_Max', loss_dict.get('critic_max_grad', 0), global_step=episode_i)
+
+        
         # ----清空buffer 准备下一个----
         buffer.clear()
 
@@ -158,11 +181,11 @@ if __name__ == '__main__':
     parser.add_argument('--move-scale', dest='move_scale', type=int, default=-1, metavar='MS', help='每个动作的位移步长, 默认为10')
     parser.add_argument('--feature-dim', dest='feature_dim', type=int, default=128, metavar='HD', help='encoder后feature的维度')
     parser.add_argument('--actor-lr', dest='actor_lr', type=float, default=0.0001, metavar='AL', help='actor的学习率')
-    parser.add_argument('--critic-lr', dest='critic_lr', type=float, default=0.001, metavar='CL', help='critic的学习率')
+    parser.add_argument('--critic-lr', dest='critic_lr', type=float, default=0.0001, metavar='CL', help='critic的学习率')
     parser.add_argument('--batch-size', dest='batch_size', type=int, default=64, metavar='BS', help='每次更新的batch size')
     parser.add_argument('--ppo-epochs', dest='ppo_epochs', type=int, default=4, metavar='PE', help='PPO的更新次数')
     parser.add_argument('--clip-eps', dest='clip_eps', type=float, default=0.2, metavar='CE', help='PPO的剪切范围')
-    parser.add_argument('--entropy-coef', dest='entropy_coef', type=float, default=0.01, metavar='EC', help='熵损失的系数')
+    parser.add_argument('--entropy-coef', dest='entropy_coef', type=float, default=0.05, metavar='EC', help='熵损失的系数')
     parser.add_argument('--rollout-steps', dest='rollout_steps', type=int, default=128, metavar='RS', help='rollout的步数')
     parser.add_argument('--save', dest='save', action='store_true', help='是否保存模型')
     parser.add_argument('--save-interval', dest='save_interval', type=int, default=100, metavar='SI', help='保存模型的间隔')
@@ -176,22 +199,27 @@ if __name__ == '__main__':
     env = Pose_Env_Base(args)    
 
     # 2.各网络模块初始化
-    actor_encoder = ActorEncoder(obs_dim=env.state_dim, hidden_dim=args.feature_dim)
+    actor_encoder = ActorEncoder(obs_dim=env.state_dim+1, hidden_dim=args.feature_dim)
     critic_encoder = CriticEncoder(state_dim=env.state_dim, hidden_dim=args.feature_dim)
-    policy_net = PolicyNet(input_dim=args.feature_dim, action_dim=9, hidden_dim=512, head_name=args.model)
+    policy_net = PolicyNet(input_dim=args.feature_dim+4+env.num_cameras, action_dim=9, hidden_dim=512, head_name=args.model) # 这里暂时先这样写
     value_net = ValueNet(input_dim=args.feature_dim, hidden_dim=512, head_name=args.model)
     actor_net = ActorNet(actor_encoder, policy_net)
     critic_net = CriticNet(critic_encoder, value_net)
 
     # 3.Agent 初始化
-    agent = MAPPOAgent(actor_net, critic_net, device)
+    agent = MAPPOAgent(actor_net, critic_net, device, 
+                       actor_lr=args.actor_lr, 
+                       critic_lr=args.critic_lr, 
+                       clip_eps=args.clip_eps, 
+                       entropy_coef=args.entropy_coef, 
+                       critic_coef=0.5)  # 这里的critic_coef可以根据需要调整
 
     # 4.Buffer初始化
     buffer = RolloutBuffer(
         rollout_steps=args.rollout_steps,
         num_cameras=env.num_cameras,
         num_targets=env.num_targets,
-        obs_shape=(args.max_visual_num, env.state_dim),
+        obs_shape=(env.num_targets, env.state_dim+1),
         global_state_shape=(env.num_cameras, env.num_targets, env.state_dim),
         device=device
     )

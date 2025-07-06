@@ -5,8 +5,8 @@ import json
 from gym import spaces
 import numpy as np
 from .potential_field import calculate_attract_potential, calculate_repel_potential
-from .reward_fuctions import RewardFunction, Reward_Cover_Only
-from .render1 import render
+from .reward_fuctions import RewardFunction, Reward_Cover_Only, Reward_QualityDeltaGlobal, Reward_Ultra_Simple
+from .render import render
 
 class Pose_Env_Base(gym.Env):
     def __init__(self, args, config_name='env.json', setting_path=None):
@@ -117,7 +117,10 @@ class Pose_Env_Base(gym.Env):
         self.rewards = np.zeros(self.num_cameras, dtype=np.float32) # 奖励
         self.reward_mode = 'hybrid' # 奖励模式
         # self.reward_manager = RewardFunction(mode=self.reward_mode) # 奖励函数管理器
-        self.reward_manager = Reward_Cover_Only() # 奖励函数管理器, 目前只考虑覆盖率奖励
+        # self.reward_manager = Reward_Cover_Only() # 奖励函数管理器, 目前只考虑覆盖率奖励
+        # self.reward_manager = Reward_QualityDeltaGlobal() 
+        self.reward_manager = Reward_Ultra_Simple() # 超简单奖励函数，直接计算覆盖率
+
         '''初始化环境'''
         self.reset()
 
@@ -128,7 +131,7 @@ class Pose_Env_Base(gym.Env):
         self.num_episodes += 1 # episode数量计数器
         self.steps = 0 # 步数计数器
         self.rewards = np.zeros(self.num_cameras, dtype=np.float32) # 奖励
-        
+        self.global_covered_mask_prev = np.zeros(self.num_targets, dtype=bool) # 上一帧中每个目标是否被覆盖的掩码
         # self.state = self.observation_space # 初始化状态
         
         # ----初始化相机----
@@ -181,11 +184,11 @@ class Pose_Env_Base(gym.Env):
     
     def update_state(self):
         '''更新状态, 将全局状态和局部观测分开管理，全局状态是所有相机和目标的状态，局部观测是每个相机自己看到的目标情况'''
-        obs_space = np.zeros_like(self.observation_space) # obs_space是全局状态
+        global_state = np.zeros_like(self.observation_space) # global_state是当前步的全局状态
         for i in range(self.num_cameras):
             for j in range(self.num_targets):
-                obs_space[i][j][0] = self.get_distance(self.cameras[i], self.targets[j]) # 计算距离
-                obs_space[i][j][1] = self.get_angle(self.cameras[i], self.targets[j]) # 计算角度
+                global_state[i][j][0] = self.get_distance(self.cameras[i], self.targets[j]) # 计算距离
+                global_state[i][j][1] = self.get_angle(self.cameras[i], self.targets[j]) # 计算角度
                 self.attract_potential[i][j] = calculate_attract_potential(self.cameras[i], self.targets[j], self.visual_distance, self.visual_angle) # 计算吸引势能
         
         for i in range(self.num_cameras): # 计算斥力势能
@@ -199,19 +202,40 @@ class Pose_Env_Base(gym.Env):
 
         self.calculate_visible() # 计算可见性
 
-        # obs_list是每个相机自己的观测 
-        obs_list = []
+        # local_obs是每个相机自己的观测 
+        # local_obs = []
+        # for i in range(self.num_cameras):
+        #     camera_obs = []
+        #     for j in range(self.num_targets):
+        #         if self.visibility_matrix[i][j] == 1:
+        #             d = global_state[i][j][0] # 距离
+        #             theta = global_state[i][j][1] # 角度
+        #             camera_obs.append([d, theta])
+        #     local_obs.append(camera_obs) # 每个相机的观测是一个列表，里面是可见目标的距离和角度
+
+        # 去中心化的obs(相机的观察)
+        local_obs = []
         for i in range(self.num_cameras):
             camera_obs = []
             for j in range(self.num_targets):
-                if self.visibility_matrix[i][j] == 1:
-                    d = obs_space[i][j][0] # 距离
-                    theta = obs_space[i][j][1] # 角度
-                    camera_obs.append([d, theta])
-            obs_list.append(camera_obs) # 每个相机的观测是一个列表，里面是可见目标的距离和角度
+                if self.visibility_matrix[i][j] == 1: # 如果相机i能看到目标j
+                    d = global_state[i][j][0] # 距离
+                    theta = global_state[i][j][1] # 角度
+                    camera_obs += [d / 1200, np.sin(theta / 180 * np.pi), np.cos(theta / 180 * np.pi)] # 1200是用于归一（MCTS用的是高宽一半中的较大值，后面再改写一下）
+                else:
+                    camera_obs += [-1, -1, -1] # 如果不可见，填充为[-1, -1]
+            camera_obs += [(self.cameras[i][0] - 0) / 1200, (self.cameras[i][1] - 0) / 1200, np.sin(self.cameras[i][2] / 180 * np.pi), np.cos(self.cameras[i][2] / 180 * np.pi)] # 加上自身位置和角度信息：相机位置和角度归一化
+            one_hot = [0] * self.num_cameras
+            one_hot[i] = 1 # 相机的one-hot编码
+            camera_obs += one_hot # 加上相机的one-hot编码
+            local_obs.append(camera_obs) # 每个相机的观测是一个列表，里面是可见目标的距离和角度，以及自身位置和角度信息,自身的onehot编码
+        
+        # 中心化的obs(用于Critic)
+        # global_obs = np.concatenate(local_obs, axis=0)
+        
         self.state = {
-            'global': obs_space,
-            'obs': obs_list
+            'global': global_state, # 全局观察，用于critic
+            'obs': local_obs # 用于actor
         }
         return self.state
 
@@ -317,6 +341,7 @@ class Pose_Env_Base(gym.Env):
         return self.visibility_matrix[camera_id][target_id]
     
     def target_move(self):
+        delta_time = 1.3
         if self.target_move_type == 'random':
             '''目前是随机移动'''
             for i in range(self.num_targets):
@@ -346,8 +371,8 @@ class Pose_Env_Base(gym.Env):
                 delta = goal.act(pose)  # 获取目标的移动向量
 
                 # 更新目标位置
-                self.targets[i][0] += delta[0]
-                self.targets[i][1] += delta[1]
+                self.targets[i][0] += delta[0] * delta_time
+                self.targets[i][1] += delta[1] * delta_time
 
                 # 边界处理
                 self.targets[i][0] = max(min(self.targets[i][0], self.area[1]), self.area[0])
@@ -397,7 +422,7 @@ class Pose_Env_Base(gym.Env):
             else:
                 x += direction * self.move_scale
         
-        elif x == xmax and ymin <= y < ymax: # 在右边
+        elif x == xmax and ymin <= y <= ymax: # 在右边
             if (y + direction * self.move_scale) > ymax:
                 d_broader = ymax - y
                 y = ymax
@@ -476,8 +501,9 @@ class Pose_Env_Base(gym.Env):
         #         self.rewards[i] = self.reward_manager.calculate_soft_transition_reward(i, self.camera_potential, self.visibility_matrix)
 
         # 只考虑覆盖率
-        self.rewards = self.reward_manager.calculate_reward(self.visibility_matrix)
-    
+        self.rewards, global_covered_mask = self.reward_manager.calculate_reward(self.visibility_matrix, self.state['global'], self.global_covered_mask_prev)
+        '''更新全局覆盖掩码'''
+        self.global_covered_mask_prev = global_covered_mask
 
         
 class GoalNavAgent:

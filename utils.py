@@ -57,3 +57,38 @@ def process_obs_list(obs_list, max_visual_num, obs_dim=2, device='cpu', strategy
         obs_mask[i, :obs_len] = 1.0
 
     return obs_tensor, obs_mask
+
+def process_obs(local_obs, num_targets, device='cpu', obs_dim=3):
+    '''
+    将相机的本地观测local_obs处理为张量形式，适用于Actor的输入
+    local_obs (N, M*3+4+N) 3:obs_dim
+    将local_obs拆分成三部分：
+    -目标特征 obs_tensor[N, M, 3] 3:obs_dim
+    -obs_mask[N, M] 观测掩码，表明哪些目标是真实观测
+    -相机特征 camera_tensor[N, 4+N] 4:相机
+    '''
+    local_obs = np.array(local_obs)
+    N = local_obs.shape[0]  # 相机数量
+    target_feat_len = num_targets * obs_dim  # 每个相机的目标特征长度
+    self_feat_len = 4 + N # 每个相机的自身特征长度（位置、角度、one-hot编码）
+
+    obs_tensor = []
+    obs_mask = []
+    self_info = []
+    for i in range(N):
+        obs_i = local_obs[i] # [M*3+4+N]
+        target_feats = obs_i[:target_feat_len].reshape(num_targets, obs_dim)  # [M, 3]
+        self_feats = obs_i[target_feat_len:] # [4+N]
+
+        # mask: 若d=-1，则表示目标不可见
+        d = target_feats[:, 0]
+        mask = (d != -1)
+        obs_tensor.append(target_feats)
+        obs_mask.append(mask)
+        self_info.append(self_feats)
+
+    obs_tensor = torch.tensor(np.array(obs_tensor), dtype=torch.float32, device=device)  # [N, M, obs_dim]
+    obs_mask = torch.tensor(np.array(obs_mask), dtype=torch.bool, device=device)  # [N, M]
+    self_info = torch.tensor(np.array(self_info), dtype=torch.float32, device=device)  # [N, 4+N]
+
+    return obs_tensor, obs_mask, self_info # 返回处理后的张量形式的观测数据

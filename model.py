@@ -52,14 +52,19 @@ class ActorEncoder(nn.Module):
     '''
     简单的自注意力编码器, 完成从obs_tensor到encoder_out的映射，用于Actor网络
     '''
-    def __init__(self, obs_dim=2, hidden_dim=64, n_heads=2, dropout=0.1):
+    def __init__(self, obs_dim=3, hidden_dim=64, n_heads=2, dropout=0.1):
         super(ActorEncoder, self).__init__()
-        self.input_proj = nn.Linear(obs_dim, hidden_dim) # 输入投影层，将输入的观测维度映射到隐藏层维度
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=n_heads, dropout=dropout, batch_first=True) # 多头自注意力层
+        self.hidden_dim = hidden_dim # 隐藏层维度
+        self.obs_dim = obs_dim # 观测维度
+        self.n_heads = n_heads # 多头注意力的头数
+        self.dropout = dropout # dropout率
+
+        self.input_proj = nn.Linear(self.obs_dim, self.hidden_dim) # 输入投影层，将输入的观测维度映射到隐藏层维度
+        self.attention = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=self.n_heads, dropout=self.dropout, batch_first=True) # 多头自注意力层
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(self.hidden_dim, self.hidden_dim)
         )
 
     def forward(self, obs_tensor, obs_mask):
@@ -147,17 +152,18 @@ class ActorNet(nn.Module):
         self.encoder = encoder
         self.policy_head = policy_head
 
-    def forward(self, obs_tensor, obs_mask, availabel_actions=None):
+    def forward(self, obs_tensor, obs_mask, self_info, availabel_actions=None):
         '''
         obs_tensor: (num_cameras, max_visual_num, obs_dim) 观测张量
         obs_mask: (num_cameras, max_visual_num) 观测掩码
+        self_info: (num_cameras, 4 + num_cameras) 相机自身信息张量，包含位置、角度和one-hot编码
         availabel_actions: (num_cameras, Action) 可用动作的掩码,用于屏蔽不可用的动作
         '''
 
         '''--------这里要做一个观测不到任何目标的obs的处理逻辑，现在是直接输出0向量，但可能不太好，后续想想如何改进---------'''
 
         num_cameras = obs_tensor.shape[0] # 获取相机数量
-        hidden_dim = self.policy_head.input_dim # 获取隐藏层维度
+        hidden_dim = self.encoder.hidden_dim # 获取隐藏层维度
         device = obs_tensor.device # 获取设备信息
 
         #检测哪些相机有有效观测
@@ -169,8 +175,11 @@ class ActorNet(nn.Module):
             features[valid_mask] = features_valid
 
         # features = self.encoder(obs_tensor, obs_mask) # (num_cameras, hidden_dim)
+        
+        actor_input = torch.cat([features, self_info], dim=-1) # 将编码后的特征和相机自身信息拼接在一起 (num_cameras, hidden_dim + 4 + num_cameras)
+
         # 进入策略头
-        logits = self.policy_head(features, availabel_actions) # (num_cameras, action_dim)
+        logits = self.policy_head(actor_input, availabel_actions) # (num_cameras, action_dim)
         return logits
 
     def sample_noise(self):

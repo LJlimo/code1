@@ -102,3 +102,70 @@ class Reward_Cover_Only:
             local_reward = np.sum(visibility_matrix, axis=1) / (np.sum(covered))
         reward = self.lambda_global * global_reward + (1 - self.lambda_global) * local_reward
         return reward
+    
+
+class Reward_QualityDeltaGlobal:
+    def __init__(self, alpha=1.0, beta=1.0, gamma=0.1, alpha_dist=1.0):
+        """
+        alpha: 感知质量奖励权重
+        beta: 首次覆盖奖励权重
+        gamma: 全局覆盖率奖励权重
+        alpha_dist: 距离惩罚的指数系数
+        """
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.alpha_dist = alpha_dist
+
+    def calculate_reward(self, visibility_matrix, global_state, global_covered_mask_prev):
+        """
+        visibility_matrix: np.array [N, G]，相机是否能看到目标（0/1）
+        global_state: np.array [N, G, 2]，每个目标的 (距离d, 相对角度theta)，theta单位为弧度
+        global_covered_mask_prev: np.array [G]，上一帧中每个目标是否已被覆盖（0/1）
+
+        返回：
+        - reward: np.array [N]，每个相机的最终奖励
+        - global_covered_mask: np.array [G]，当前帧中目标的覆盖掩码（供下一帧用）
+        """
+        N, M = visibility_matrix.shape  # N: 相机数量, M: 目标数量
+        reward = np.zeros(N) # 每个相机的奖励
+        quality_reward = np.zeros(N) # 感知质量奖励
+        delta_reward = np.zeros(N) # 首次覆盖奖励
+
+        global_covered_mask = np.any(visibility_matrix, axis=0)  # 当前帧中每个目标是否被覆盖
+
+        # ---- 1. 感知质量奖励 ----
+        for i in range(N):
+            for j in range(M):
+                if visibility_matrix[i, j] == 1:
+                    d, theta = global_state[i, j]
+                    quality = np.exp(-self.alpha_dist * d) * np.cos(theta) # 感知质量
+                    quality_reward[i] += quality
+        
+        # ---- 2. 首次覆盖奖励 ----
+        delta_covered = np.logical_and(global_covered_mask, np.logical_not(global_covered_mask_prev)) # [M]
+        for i in range(N):
+            for j in range(M):
+                if visibility_matrix[i, j] == 1 and delta_covered[j]:
+                    delta_reward[i] += 1.0
+        
+        # ---- 3. 全局覆盖率奖励 每个agent都一样----
+        global_reward = np.sum(global_covered_mask) / M if M > 0 else 0.0
+
+        # ---- 4. 最终奖励计算 ----
+        reward = (self.alpha * quality_reward + 
+                  self.beta * delta_reward + 
+                  self.gamma * global_reward)
+        
+        return reward, global_covered_mask 
+    
+class Reward_Ultra_Simple:
+    def __init__(self):
+        pass
+    
+    def calculate_reward(self, visibility_matrix, global_state, global_covered_mask_prev):
+        """超简化：只返回覆盖率"""
+        coverage_rate = np.mean(np.any(visibility_matrix, axis=0))
+        reward = np.full(visibility_matrix.shape[0], coverage_rate)
+        global_covered_mask = np.any(visibility_matrix, axis=0)
+        return reward, global_covered_mask

@@ -16,11 +16,12 @@ class RolloutBuffer:
         self.num_cameras = num_cameras
         self.num_targets = num_targets
         self.obs_shape = obs_shape
+        self.self_info_shape = (4 + num_cameras,)  # 相机自身信息的形状 (4 + num_cameras) 4: 相机位置和角度
         self.global_state_shape = global_state_shape
         self.device = device
         self.clear()
 
-    def insert(self, obs_tensor, obs_mask, global_state, actions, log_probs, rewards, values, dones):
+    def insert(self, obs_tensor, obs_mask, self_info, global_state, actions, log_probs, rewards, values, dones):
         '''
         存储一条经验
         每个时间步插入N个相机的数据
@@ -29,6 +30,7 @@ class RolloutBuffer:
         '''
         self.obs_tensor.append(obs_tensor)
         self.obs_mask.append(obs_mask)
+        self.self_info.append(self_info)
         self.global_state.append(global_state)
         self.actions.append(actions)
         self.log_probs.append(log_probs)
@@ -60,12 +62,14 @@ class RolloutBuffer:
             last_adv = delta + gamma * gae_lambda * mask * last_adv
             advantages[t] = last_adv
             returns[t] = advantages[t] + self.values[t].detach()
-        
+
         if normalize_adv:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+
         self.advantages = advantages
         self.returns = returns
+
+        
 
     def get_flattened_data(self):
         '''
@@ -78,13 +82,14 @@ class RolloutBuffer:
         '''
         obs_tensor = torch.stack(self.obs_tensor).reshape(-1, *self.obs_shape)  # [T*N, L, D]
         obs_mask = torch.stack(self.obs_mask).reshape(-1, self.obs_shape[0]) # [T*N, L]
+        self_info = torch.stack(self.self_info).reshape(-1, self.self_info_shape[-1]) # [T*N, 4+N]
         state = torch.stack(self.global_state).reshape(-1, self.global_state_shape[1], self.global_state_shape[2]) # [T*N, M, D]
         actions = torch.stack(self.actions).reshape(-1)
         log_probs = torch.stack(self.log_probs).reshape(-1)
         advantages = self.advantages.reshape(-1)
         returns = self.returns.reshape(-1)
 
-        return obs_tensor, obs_mask, state, actions, log_probs, advantages, returns
+        return obs_tensor, obs_mask, self_info, state, actions, log_probs, advantages, returns
         # 这里返回的是一个大批量的观测数据，形状为[T*N, ..., ...]
     
     def get_batches(self, batch_size, ppo_epochs):
@@ -93,7 +98,7 @@ class RolloutBuffer:
         batch_size: 批量大小
         ppo_epochs: PPO的epoch数
         '''
-        obs_tensor, obs_mask, state, actions, log_probs, advantages, returns = self.get_flattened_data()
+        obs_tensor, obs_mask, self_info, state, actions, log_probs, advantages, returns = self.get_flattened_data()
         total_samples = obs_tensor.size(0)
         
         for _ in range(ppo_epochs):
@@ -101,7 +106,7 @@ class RolloutBuffer:
             for start in range(0, total_samples, batch_size):
                 end = min(start + batch_size, total_samples) # 防止最后一个batch不满或越界
                 idx = [indices[start:end]]
-                yield obs_tensor[idx], obs_mask[idx], state[idx], actions[idx], log_probs[idx], advantages[idx], returns[idx]
+                yield obs_tensor[idx], obs_mask[idx], self_info[idx], state[idx], actions[idx], log_probs[idx], advantages[idx], returns[idx]
 
 
 
@@ -109,6 +114,7 @@ class RolloutBuffer:
         '''清空回放池'''
         self.obs_tensor = []
         self.obs_mask = []
+        self.self_info = []
         self.global_state = []
         self.actions = []
         self.log_probs = []

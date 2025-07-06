@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 class MAPPOAgent:
-    def __init__(self, actor_net, critic_net, device='cpu', actor_lr=1e-4, critic_lr=1e-3, clip_eps=0.2, entropy_coef=0.01, critic_coef=0.5):
+    def __init__(self, actor_net, critic_net, device='cpu', actor_lr=1e-4, critic_lr=1e-4, clip_eps=0.2, entropy_coef=0.05, critic_coef=0.5):
         self.device = device
         self.actor_net = actor_net.to(device)
         self.critic_net = critic_net.to(device)
@@ -16,7 +16,7 @@ class MAPPOAgent:
         self.critic_coef = critic_coef
 
     
-    def select_action(self, obs_tensor, obs_mask, avail_actions=None):
+    def select_action(self, obs_tensor, obs_mask, self_info, avail_actions=None):
         '''
         根据观察选择动作
         输入：
@@ -27,7 +27,7 @@ class MAPPOAgent:
             actions: (N,)
             log_probs: (N,)
         '''
-        logits = self.actor_net(obs_tensor, obs_mask, avail_actions) # (N, action_dim)
+        logits = self.actor_net(obs_tensor, obs_mask, self_info, avail_actions) # (N, action_dim)
         probs = F.softmax(logits, dim=-1) # (N, action_dim)
         dist = Categorical(probs)
         actions = dist.sample()
@@ -35,7 +35,7 @@ class MAPPOAgent:
 
         return actions, log_probs
     
-    def evaluate_actions(self, obs_tensor, obs_mask, actions, avail_actions, global_state):
+    def evaluate_actions(self, obs_tensor, obs_mask, self_info, actions, avail_actions, global_state):
         '''
         在训练时使用：在当前新的策略下重新计算新的log_probs和熵，后面用作策略更新
         输入：
@@ -48,7 +48,7 @@ class MAPPOAgent:
             log_probs: (N,)
             entropy: (N,)
         '''
-        logits = self.actor_net(obs_tensor, obs_mask, avail_actions)
+        logits = self.actor_net(obs_tensor, obs_mask, self_info, avail_actions)
         probs = F.softmax(logits, dim=-1)
         dist = Categorical(probs)
         log_probs = dist.log_prob(actions) # (N,)
@@ -58,9 +58,9 @@ class MAPPOAgent:
         values = self.critic_net(global_state).squeeze(-1) # (N,)
         return log_probs, entropy, values
     
-    def compute_ppo_loss(self, obs_tensor, obs_mask, global_state, actions, old_log_probs, advantages, returns, clip_eps=0.2, entropy_coef=0.01, critic_coef=0.5):
+    def compute_ppo_loss(self, obs_tensor, obs_mask, self_info, global_state, actions, old_log_probs, advantages, returns, clip_eps=0.2, entropy_coef=0.01, critic_coef=0.5):
         # ----Actor 前向计算----
-        logits = self.actor_net(obs_tensor, obs_mask) # 输出logits （B, action_dim)
+        logits = self.actor_net(obs_tensor, obs_mask, self_info) # 输出logits （B, action_dim)
         dist = torch.distributions.Categorical(logits=logits) # 创建分布对象
         new_log_probs = dist.log_prob(actions) # 计算新的log_probs, (B,)
         entropy = dist.entropy().mean() # 计算熵, (B,)
@@ -71,7 +71,9 @@ class MAPPOAgent:
         # ----PPO clip 策略损失（Actor）----
         surr1 = ratio * advantages # (B,)
         surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages # (B,)
-        actor_loss = -torch.min(surr1, surr2).mean() - entropy_coef * entropy # 这里的actor损失加上了熵损失，便于后面通过actor的优化器更新(B,)
+        policy_loss = -torch.min(surr1, surr2).mean() # (B,)
+        entropy_loss = -entropy_coef * entropy # (B,)
+        actor_loss = policy_loss + entropy_loss # 这里的actor损失加上了熵损失，便于后面通过actor的优化器更新(B,)
 
         # ----Critic 前向计算----
         values = self.critic_net(global_state).squeeze(-1) # (B,)
@@ -85,7 +87,7 @@ class MAPPOAgent:
             'total_loss': total_loss.item(),
             'actor_loss': actor_loss.item(),
             'critic_loss': critic_loss.item(),
-            'entropy': entropy.item(),
+            'entropy_loss': entropy_loss.item(),
         }
 
         return actor_loss, critic_loss, entropy, loss_dict
@@ -97,29 +99,71 @@ class MAPPOAgent:
             batch: (obs, obs_mask, state, actions, log_probs, advantages, returns)
             global_states: 全局状态
         '''
-        obs_tensor, obs_mask, global_state, actions, old_log_probs, advantages, returns = batch
+        obs_tensor, obs_mask, self_info, global_state, actions, old_log_probs, advantages, returns = batch
 
         # 计算损失
         actor_loss, critic_loss, entropy, loss_dict = self.compute_ppo_loss(
             obs_tensor=obs_tensor,
             obs_mask=obs_mask,
+            self_info=self_info,
             global_state=global_state,
             actions=actions,
             old_log_probs=old_log_probs,
             advantages=advantages,
             returns=returns,
+            clip_eps=self.clip_eps,
+            entropy_coef=self.entropy_coef,
+            critic_coef=self.critic_coef
         )
 
         # ----分开更新 Actor ----
         self.actor_optimizer.zero_grad()
         # actor_loss.backward(retain_graph=True)
         actor_loss.backward() # 不共享encoder可以不用这个参数
+        torch.nn.utils.clip_grad_norm_(self.actor_net.parameters(), max_norm=2.0)
+
+        # 计算Actor梯度范数---测试
+        actor_grad_norm = 0
+        actor_max_grad = 0
+        for name, param in self.actor_net.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.data.norm(2).item()
+                actor_grad_norm += grad_norm ** 2
+                actor_max_grad = max(actor_max_grad, grad_norm)
+        actor_grad_norm = actor_grad_norm ** 0.5
+
         self.actor_optimizer.step()
 
         # ----分开更新 Critic ----
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(), max_norm=1.0)  # 严格裁剪
+        # 计算Critic梯度范数--测试
+        critic_grad_norm = 0
+        critic_max_grad = 0
+        for name, param in self.critic_net.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.data.norm(2).item()
+                critic_grad_norm += grad_norm ** 2
+                critic_max_grad = max(critic_max_grad, grad_norm)
+        critic_grad_norm = critic_grad_norm ** 0.5
+
         self.critic_optimizer.step()
+
+        # ====== 梯度信息记录 ======
+        loss_dict.update({
+            'actor_grad_norm': actor_grad_norm,
+            'critic_grad_norm': critic_grad_norm,
+            'actor_max_grad': actor_max_grad,
+            'critic_max_grad': critic_max_grad
+        })
+        
+        # ====== 梯度异常检测 ======
+        if actor_grad_norm > 5.0 or critic_grad_norm > 5.0:
+            print(f"🚨 大梯度检测! Episode: Actor={actor_grad_norm:.3f}, Critic={critic_grad_norm:.3f}")
+        
+        if actor_grad_norm > 50 or critic_grad_norm > 50:
+            print(f"💥 极大梯度! Episode: Actor={actor_grad_norm:.3f}, Critic={critic_grad_norm:.3f}")
 
         return loss_dict
     
